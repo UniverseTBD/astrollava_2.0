@@ -29,6 +29,7 @@ import json
 import os
 import shutil
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,38 @@ CATALOG_COLUMNS = [
     "stellar_half_mass_radius_kpc",
 ]
 
+# Each Atlas archive contains 5 observers x 48 products per observer.
+PRODUCTS_PER_OBSERVER = 48
+OBSERVER_COUNT = 5
+EXPECTED_PRODUCT_COUNT = PRODUCTS_PER_OBSERVER * OBSERVER_COUNT
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The TNG data portal is prone to slow transfers and gateway timeouts on
+# large archives. Retry transient failures with backoff, and resume the
+# partial ".part" file via HTTP Range instead of restarting from zero.
+MAX_DOWNLOAD_ATTEMPTS = 8
+RETRY_BASE_DELAY_SECONDS = 5.0
+RETRY_MAX_DELAY_SECONDS = 120.0
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable_error(error: requests.exceptions.RequestException) -> bool:
+    response = getattr(error, "response", None)
+    if response is None:
+        # Connection drop / read timeout with no HTTP response: transient.
+        return True
+    return response.status_code in RETRYABLE_STATUS_CODES
+
+
+def _wait_before_retry(attempt: int) -> None:
+    delay = min(
+        RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+        RETRY_MAX_DELAY_SECONDS,
+    )
+    print(f"Retrying in {delay:.0f}s (attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS})...")
+    time.sleep(delay)
+
 
 def download_file(
     url: str,
@@ -69,40 +102,70 @@ def download_file(
     *,
     headers: dict[str, str] | None = None,
 ) -> None:
-    """Download a file atomically with a progress indicator."""
+    """Download a file atomically, resuming and retrying on transient errors."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".part")
 
-    with requests.get(
-        url,
-        headers=headers,
-        stream=True,
-        timeout=(30, 300),
-    ) as response:
-        response.raise_for_status()
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+        resume_from = temporary.stat().st_size if temporary.exists() else 0
+        request_headers = dict(headers or {})
+        if resume_from:
+            request_headers["Range"] = f"bytes={resume_from}-"
 
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            raise RuntimeError(
-                f"Unexpected JSON response from {url}: {response.text}"
-            )
+        try:
+            with requests.get(
+                url,
+                headers=request_headers,
+                stream=True,
+                timeout=(30, 300),
+            ) as response:
+                if response.status_code == 416:
+                    # Our partial file is already complete or corrupt from
+                    # the server's point of view; drop it and start over.
+                    temporary.unlink(missing_ok=True)
+                    raise requests.exceptions.HTTPError(
+                        "416 Range Not Satisfiable", response=response
+                    )
 
-        total = int(response.headers.get("content-length", 0))
+                response.raise_for_status()
 
-        with temporary.open("wb") as output, tqdm(
-            total=total or None,
-            unit="B",
-            unit_scale=True,
-            desc=destination.name,
-        ) as progress:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
+                content_type = response.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    raise RuntimeError(
+                        f"Unexpected JSON response from {url}: {response.text}"
+                    )
 
-                output.write(chunk)
-                progress.update(len(chunk))
+                resuming = bool(resume_from) and response.status_code == 206
+                if resume_from and not resuming:
+                    # Server ignored the Range request; restart from zero.
+                    resume_from = 0
 
-    temporary.replace(destination)
+                remaining = int(response.headers.get("content-length", 0))
+                total = (resume_from + remaining) if remaining else None
+
+                with temporary.open("ab" if resuming else "wb") as output, tqdm(
+                    total=total,
+                    initial=resume_from,
+                    unit="B",
+                    unit_scale=True,
+                    desc=destination.name,
+                ) as progress:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+
+                        output.write(chunk)
+                        progress.update(len(chunk))
+
+            temporary.replace(destination)
+            return
+
+        except requests.exceptions.RequestException as error:
+            if attempt == MAX_DOWNLOAD_ATTEMPTS or not _is_retryable_error(error):
+                raise
+
+            print(f"Download error ({error}); will retry.")
+            _wait_before_retry(attempt)
 
 
 def safe_extract_tar(archive_path: Path, destination: Path) -> None:
@@ -123,7 +186,7 @@ def safe_extract_tar(archive_path: Path, destination: Path) -> None:
 
 
 def object_directory(subhalo_id: int) -> Path:
-    return Path("data/atlas") / f"TNG{subhalo_id:06d}"
+    return REPO_ROOT / "data" / "atlas" / f"TNG{subhalo_id:06d}"
 
 
 def command_download(args: argparse.Namespace) -> None:
@@ -144,10 +207,14 @@ def command_download(args: argparse.Namespace) -> None:
     extraction_dir = object_dir / "files"
 
     if args.force:
-        if archive_path.exists():
-            archive_path.unlink()
-        if catalog_path.exists():
-            catalog_path.unlink()
+        for path in (
+            archive_path,
+            archive_path.with_suffix(archive_path.suffix + ".part"),
+            catalog_path,
+            catalog_path.with_suffix(catalog_path.suffix + ".part"),
+        ):
+            if path.exists():
+                path.unlink()
         if extraction_dir.exists():
             shutil.rmtree(extraction_dir)
 
@@ -183,9 +250,11 @@ def command_download(args: argparse.Namespace) -> None:
     print(f"\nFound {len(fits_files)} FITS files.")
     print(f"Object directory: {object_dir.resolve()}")
 
-    if len(fits_files) != 200:
+    if len(fits_files) != EXPECTED_PRODUCT_COUNT:
         print(
-            "Warning: the Atlas paper describes 200 products per galaxy. "
+            f"Warning: expected {EXPECTED_PRODUCT_COUNT} products per "
+            f"galaxy ({OBSERVER_COUNT} observers x "
+            f"{PRODUCTS_PER_OBSERVER} products). "
             "Inspect the extracted archive before continuing."
         )
 
@@ -310,6 +379,41 @@ def load_catalog_row(
     }
 
 
+def expected_atlas_filename(
+    subhalo_id: int,
+    observer: str,
+    band: str,
+) -> str:
+    return f"TNG{subhalo_id:06d}_{observer}_LSST_{band}.fits"
+
+
+def validate_atlas_input(
+    label: str,
+    path: Path,
+    *,
+    subhalo_id: int,
+    observer: str,
+    band: str,
+) -> None:
+    """Guard against silently mislabeled captioning data.
+
+    The build command trusts --subhalo-id/--observer to write the
+    LLaVA record's metadata, independently of the --u/--g/--z paths.
+    Without this check, a mismatched or dust-free (_nodust) file would
+    still produce a confidently-labeled but wrong record.
+    """
+    expected = expected_atlas_filename(subhalo_id, observer, band)
+
+    if path.name != expected:
+        raise ValueError(
+            f"{label} image {path.name!r} does not match the "
+            f"requested subhalo/observer/band. Expected {expected!r}. "
+            "Pass the dust-attenuated Atlas file for the same "
+            "--subhalo-id/--observer, not a --nodust variant or a "
+            "different object's product."
+        )
+
+
 def command_build(args: argparse.Namespace) -> None:
     object_dir = object_directory(args.subhalo_id)
     catalog_path = object_dir / "atlas_catalog.txt"
@@ -319,12 +423,21 @@ def command_build(args: argparse.Namespace) -> None:
         "lsst_g": Path(args.g),
         "lsst_z": Path(args.z),
     }
+    bands = {"lsst_u": "u", "lsst_g": "g", "lsst_z": "z"}
 
     for label, path in paths.items():
         if not path.is_file():
             raise FileNotFoundError(
                 f"{label} image does not exist: {path}"
             )
+
+        validate_atlas_input(
+            label,
+            path,
+            subhalo_id=args.subhalo_id,
+            observer=args.observer,
+            band=bands[label],
+        )
 
     images: dict[str, np.ndarray] = {}
     headers: dict[str, fits.Header] = {}
@@ -382,7 +495,10 @@ def command_build(args: argparse.Namespace) -> None:
     )
 
     output_dir = (
-        Path("outputs/demo")
+        REPO_ROOT
+        / "data"
+        / "atlas_outputs"
+        / "demo"
         / f"TNG{args.subhalo_id:06d}_{args.observer}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
