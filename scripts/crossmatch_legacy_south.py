@@ -56,7 +56,10 @@ def command_match(args: argparse.Namespace) -> None:
         suffixes=("_mention", "_legacy"),
         suffix_method="all_columns",
     )
-    manifest = matches.compute()
+    # LSDB returns a NestedFrame.  Convert its lightweight result to a regular
+    # pandas DataFrame before writing; NestedFrame.to_parquet has no `index=`
+    # parameter, unlike pandas.DataFrame.to_parquet.
+    manifest = pd.DataFrame(matches.compute())
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -127,13 +130,15 @@ def command_fetch_images(args: argparse.Namespace) -> None:
     legacy = lsdb.open_catalog(args.catalog, columns=columns)
     require_columns(legacy, columns, "Legacy catalog")
 
-    retrieved = targets.crossmatch(
-        legacy,
-        radius_arcsec=args.radius_arcsec,
-        n_neighbors=1,
-        suffixes=("_target", "_legacy"),
-        suffix_method="all_columns",
-    ).compute()
+    retrieved = pd.DataFrame(
+        targets.crossmatch(
+            legacy,
+            radius_arcsec=args.radius_arcsec,
+            n_neighbors=1,
+            suffixes=("_target", "_legacy"),
+            suffix_method="all_columns",
+        ).compute()
+    )
     if len(retrieved) != len(targets_df):
         raise RuntimeError(
             f"Retrieved {len(retrieved)} of {len(targets_df)} requested objects; "
