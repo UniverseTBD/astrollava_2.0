@@ -123,6 +123,19 @@ def normalize_catalog_columns(frame: pd.DataFrame, survey: str) -> pd.DataFrame:
     )
 
 
+def parse_selection_count(value: str) -> int | None:
+    """Parse a positive top-K count, or all for the full intersection."""
+    if value.lower() == "all":
+        return None
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("--k must be a positive integer or 'all'") from error
+    if count < 1:
+        raise argparse.ArgumentTypeError("--k must be a positive integer or 'all'")
+    return count
+
+
 def command_match(args: argparse.Namespace) -> None:
     mentions = lsdb.open_catalog(args.mentions, columns=MENTION_COLUMNS)
     catalog_columns = [*catalog_key_columns(args.survey), *SURVEYS[args.survey]["light_columns"]]
@@ -168,7 +181,7 @@ def command_top_k(args: argparse.Namespace) -> None:
         .rename("caption_count")
         .sort_values(ascending=False)
     )
-    selected_ids = counts.head(args.k).index
+    selected_ids = counts.index if args.k is None else counts.head(args.k).index
     captions = manifest[manifest[object_id].isin(selected_ids)].copy()
     objects = (
         captions.sort_values("_dist_arcsec")
@@ -180,7 +193,8 @@ def command_top_k(args: argparse.Namespace) -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{args.survey.replace('-', '_')}_top_{args.k}"
+    selection = "all" if args.k is None else f"top_{args.k}"
+    stem = f"{args.survey.replace('-', '_')}_{selection}"
     captions_path = output_dir / f"{stem}_captions.parquet"
     objects_path = output_dir / f"{stem}_objects.parquet"
     captions.to_parquet(captions_path, index=False)
@@ -267,7 +281,12 @@ def parse_args() -> argparse.Namespace:
     top_k = subparsers.add_parser("top-k", help="write the top-K caption-rich subsets")
     top_k.add_argument("manifest", help="manifest created by the match command")
     top_k.add_argument("--survey", choices=SURVEYS, default="legacy-south")
-    top_k.add_argument("--k", type=int, default=100)
+    top_k.add_argument(
+        "--k",
+        type=parse_selection_count,
+        default=100,
+        help="number of caption-rich objects, or 'all' for the full intersection",
+    )
     top_k.add_argument("--output-dir", default="outputs/crossmatches")
     top_k.set_defaults(func=command_top_k)
 
@@ -292,8 +311,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if getattr(args, "k", 1) < 1:
-        raise ValueError("--k must be at least 1")
     args.func(args)
 
 
