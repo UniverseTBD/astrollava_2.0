@@ -29,6 +29,7 @@ SURVEYS = {
         "dec_column": "dec",
         "light_columns": [],
         "image_columns": ["image", "rgb"],
+        "payload_columns": ["image", "blobmodel", "rgb", "object_mask", "catalog"],
     },
     "legacy-north": {
         "uri": "hf://datasets/UniverseTBD/mmu_ssl_legacysurvey_north",
@@ -38,6 +39,7 @@ SURVEYS = {
         "dec_column": "dec",
         "light_columns": ["z_spec"],
         "image_columns": ["image", "z_spec"],
+        "payload_columns": ["image"],
     },
     "manga": {
         "uri": "hf://datasets/hugging-science/mmu_manga",
@@ -47,6 +49,7 @@ SURVEYS = {
         "dec_column": "dec",
         "light_columns": ["z"],
         "image_columns": ["images", "z"],
+        "payload_columns": ["images", "spaxels", "maps"],
     },
     "hsc": {
         "uri": "hf://datasets/UniverseTBD/mmu_hsc_pdr3_dud_22.5",
@@ -56,6 +59,7 @@ SURVEYS = {
         "dec_column": "dec",
         "light_columns": [],
         "image_columns": ["image"],
+        "payload_columns": ["image"],
     },
     "galaxy-zoo": {
         "uri": "hf://datasets/UniverseTBD/mmu_gz10",
@@ -65,6 +69,7 @@ SURVEYS = {
         "dec_column": "dec",
         "light_columns": ["redshift", "gz10_label"],
         "image_columns": ["rgb_image", "redshift", "gz10_label", "rgb_pixel_scale"],
+        "payload_columns": ["rgb_image"],
     },
     "des-dr2": {
         "uri": "https://linea.data.lsdb.io/hats/des/des_dr2",
@@ -74,14 +79,29 @@ SURVEYS = {
         "dec_column": "DEC",
         "light_columns": [],
         "image_columns": [],
+        "payload_columns": [],
     },
 }
 MENTION_COLUMNS = [
     "mention_id",
     "ra",
     "dec",
+    "name",
+    "additional_names",
+    "coordinate_resolution_name",
     "mention_summary",
+    "uat_terms",
+    "discussion_extent",
     "arxiv_id",
+    "resolver_api_or_agent",
+    "resolver_method_used",
+    "resolver_agent_confidence",
+    "ned_object_name",
+    "ned_physical_type",
+    "ned_position_refcode",
+    "ned_url",
+    "evidence_quote_count",
+    "evidence_quotes",
     "wiki_entity_id",
 ]
 
@@ -263,6 +283,125 @@ def command_fetch_images(args: argparse.Namespace) -> None:
     print(f"Wrote {len(retrieved):,} image rows to {output}")
 
 
+
+def command_fetch_metadata(args: argparse.Namespace) -> None:
+    """Retrieve all non-image survey columns for a selected object subset."""
+    objects_path = Path(args.objects)
+    objects = pd.read_parquet(objects_path)
+    suffix = SURVEYS[args.survey]["suffix"]
+    object_id = selected_object_column(args.survey)
+    required = {object_id, f"ra_{suffix}", f"dec_{suffix}"}
+    missing = sorted(required.difference(objects.columns))
+    if missing:
+        raise ValueError(f"{objects_path} is not a {args.survey} object subset; missing {missing}")
+
+    targets_df = (
+        objects[[object_id, f"ra_{suffix}", f"dec_{suffix}"]]
+        .drop_duplicates(object_id)
+        .rename(
+            columns={
+                object_id: "target_object_id",
+                f"ra_{suffix}": "ra",
+                f"dec_{suffix}": "dec",
+            }
+        )
+    )
+    targets = lsdb.from_dataframe(targets_df, ra_column="ra", dec_column="dec")
+
+    profile = SURVEYS[args.survey]
+    schema = lsdb.open_catalog(catalog_uri(args))
+    metadata_columns = [
+        column for column in schema.columns if column not in profile["payload_columns"]
+    ]
+    catalog = lsdb.open_catalog(catalog_uri(args), columns=metadata_columns)
+    require_columns(catalog, metadata_columns, f"{args.survey} catalog")
+
+    metadata = normalize_catalog_columns(
+        pd.DataFrame(
+            targets.crossmatch(
+                catalog,
+                radius_arcsec=args.radius_arcsec,
+                n_neighbors=1,
+                suffixes=("_target", f"_{suffix}"),
+                suffix_method="all_columns",
+            ).compute()
+        ),
+        args.survey,
+    )
+    if len(metadata) != len(targets_df):
+        raise RuntimeError(
+            f"Retrieved metadata for {len(metadata)} of {len(targets_df)} requested objects"
+        )
+    if not (
+        metadata["target_object_id_target"].astype(str)
+        == metadata[object_id].astype(str)
+    ).all():
+        raise RuntimeError("Spatial retrieval returned an object ID different from its target ID")
+
+    default_name = objects_path.name.replace("_objects.parquet", "_metadata.parquet")
+    output = Path(args.output or objects_path.with_name(default_name))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata.to_parquet(output, index=False)
+    print(f"Wrote {len(metadata):,} metadata rows to {output}")
+
+
+def command_fetch_mentions(args: argparse.Namespace) -> None:
+    """Rehydrate mention fields via spatial lookup followed by exact mention_id."""
+    manifest_path = Path(args.manifest)
+    manifest = pd.read_parquet(manifest_path)
+    required = {"mention_id_mention", "ra_mention", "dec_mention"}
+    missing = sorted(required.difference(manifest.columns))
+    if missing:
+        raise ValueError(f"{manifest_path} is missing mention keys: {missing}")
+
+    targets_df = (
+        manifest[["mention_id_mention", "ra_mention", "dec_mention"]]
+        .drop_duplicates("mention_id_mention")
+        .rename(
+            columns={
+                "mention_id_mention": "target_mention_id",
+                "ra_mention": "ra",
+                "dec_mention": "dec",
+            }
+        )
+    )
+    targets = lsdb.from_dataframe(targets_df, ra_column="ra", dec_column="dec")
+    mentions = lsdb.open_catalog(args.mentions, columns=MENTION_COLUMNS)
+    require_columns(mentions, MENTION_COLUMNS, "mentions catalog")
+
+    # HATS is spatially indexed, not indexed by mention_id. Spatial matching
+    # here only finds local candidates; identity is resolved solely by the ID.
+    # lsdb.Catalog.crossmatch drops `n_neighbors=None` entirely (falls back to
+    # its own default of 1), so "all candidates within radius" has to be
+    # requested as a concrete, generously large neighbor count instead.
+    candidates = pd.DataFrame(
+        targets.crossmatch(
+            mentions,
+            radius_arcsec=args.radius_arcsec,
+            n_neighbors=args.max_candidates,
+            suffixes=("_target", "_mention"),
+            suffix_method="all_columns",
+        ).compute()
+    )
+    full_mentions = candidates.loc[
+        candidates["target_mention_id_target"].astype(str)
+        == candidates["mention_id_mention"].astype(str)
+    ].copy()
+    matched_ids = full_mentions["target_mention_id_target"].astype(str)
+    missing_ids = set(targets_df["target_mention_id"].astype(str)).difference(matched_ids)
+    duplicate_ids = matched_ids.duplicated()
+    if missing_ids or duplicate_ids.any():
+        raise RuntimeError(
+            f"Could not uniquely rehydrate mentions: {len(missing_ids)} missing, "
+            f"{int(duplicate_ids.sum())} duplicated"
+        )
+
+    default_name = f"{manifest_path.stem}_full_mentions.parquet"
+    output = Path(args.output or manifest_path.with_name(default_name))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    full_mentions.to_parquet(output, index=False)
+    print(f"Wrote {len(full_mentions):,} full mention rows to {output}")
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -306,6 +445,45 @@ def parse_args() -> argparse.Namespace:
         help="output Parquet path (default is based on --survey)",
     )
     fetch.set_defaults(func=command_fetch_images)
+
+
+    metadata = subparsers.add_parser(
+        "fetch-metadata",
+        help="retrieve all non-image survey columns for a selected object subset",
+    )
+    metadata.add_argument("objects", help="object subset created by the top-k command")
+    metadata.add_argument("--survey", choices=SURVEYS, default="legacy-south")
+    metadata.add_argument("--catalog", help="override the survey HATS URI")
+    metadata.add_argument("--radius-arcsec", type=float, default=0.1)
+    metadata.add_argument(
+        "--output",
+        help="output Parquet path (default is derived from the object subset path)",
+    )
+    metadata.set_defaults(func=command_fetch_metadata)
+
+
+    mention_data = subparsers.add_parser(
+        "fetch-mentions",
+        help="rehydrate all original mention fields for an existing manifest",
+    )
+    mention_data.add_argument("manifest", help="match manifest or caption subset")
+    mention_data.add_argument("--mentions", default=MENTIONS, help="HATS URI for literature mentions")
+    mention_data.add_argument("--radius-arcsec", type=float, default=0.1)
+    mention_data.add_argument(
+        "--max-candidates",
+        type=int,
+        default=50,
+        help=(
+            "upper bound on same-position mention candidates to fetch per target "
+            "before resolving identity by exact mention_id (lsdb has no "
+            "unlimited-neighbors mode, so this must be a concrete integer)"
+        ),
+    )
+    mention_data.add_argument(
+        "--output",
+        help="output Parquet path (default is derived from the input manifest path)",
+    )
+    mention_data.set_defaults(func=command_fetch_mentions)
     return parser.parse_args()
 
 
