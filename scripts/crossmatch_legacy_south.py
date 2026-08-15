@@ -274,10 +274,8 @@ def command_fetch_images(args: argparse.Namespace) -> None:
     ).all():
         raise RuntimeError("Spatial retrieval returned an object ID different from its target ID")
 
-    output = Path(
-        args.output
-        or f"outputs/crossmatches/{args.survey.replace('-', '_')}_top_images.parquet"
-    )
+    default_name = objects_path.name.replace("_objects.parquet", "_images.parquet")
+    output = Path(args.output or objects_path.with_name(default_name))
     output.parent.mkdir(parents=True, exist_ok=True)
     retrieved.to_parquet(output, index=False)
     print(f"Wrote {len(retrieved):,} image rows to {output}")
@@ -395,6 +393,25 @@ def command_fetch_mentions(args: argparse.Namespace) -> None:
             f"Could not uniquely rehydrate mentions: {len(missing_ids)} missing, "
             f"{int(duplicate_ids.sum())} duplicated"
         )
+
+    # Carry through the input manifest's own survey-side columns (e.g.
+    # object_id_legacy, ra_legacy, dec_legacy) so the output is self-
+    # sufficient for joining back to an object - without this, callers had
+    # to keep the input manifest/captions file around forever just to
+    # recover which object each rehydrated mention belongs to. `_mention`
+    # columns and `_dist_arcsec` are excluded: the former are literature
+    # fields already present here (fresher, from the full rehydration
+    # rather than the input's possibly-stale snapshot), the latter is this
+    # step's own crossmatch distance and would collide with the input's.
+    mention_key_cols = {"mention_id_mention", "ra_mention", "dec_mention"}
+    passthrough_columns = [
+        column
+        for column in manifest.columns
+        if column not in mention_key_cols and not column.endswith("_mention") and column != "_dist_arcsec"
+    ]
+    if passthrough_columns:
+        passthrough = manifest[["mention_id_mention", *passthrough_columns]].drop_duplicates("mention_id_mention")
+        full_mentions = full_mentions.merge(passthrough, on="mention_id_mention", how="left")
 
     default_name = f"{manifest_path.stem}_full_mentions.parquet"
     output = Path(args.output or manifest_path.with_name(default_name))
